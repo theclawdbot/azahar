@@ -137,11 +137,11 @@ Instance::Instance(bool enable_validation, bool dump_command_buffers)
                               dump_command_buffers)},
       physical_devices{instance->enumeratePhysicalDevices()} {}
 
-Instance::Instance(Frontend::EmuWindow& window, u32 physical_device_index)
+Instance::Instance(Frontend::EmuWindow& window, u32 physical_device_index, bool enable_drm_display)
     : library{OpenLibrary(&window)},
-      instance{CreateInstance(*library, window.GetWindowInfo().type,
-                              Settings::values.renderer_debug.GetValue(),
-                              Settings::values.dump_command_buffers.GetValue())},
+      instance{CreateInstance(
+          *library, window.GetWindowInfo().type, Settings::values.renderer_debug.GetValue(),
+          Settings::values.dump_command_buffers.GetValue(), enable_drm_display)},
       debug_callback{CreateDebugCallback(*instance, debug_utils_supported)},
       physical_devices{instance->enumeratePhysicalDevices()} {
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());

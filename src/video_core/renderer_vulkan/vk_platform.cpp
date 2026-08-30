@@ -14,7 +14,9 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
@@ -125,10 +127,133 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
     return library;
 }
 
+// Creates a VK_KHR_display surface on a leased DRM connector. The lease fd
+// comes from the frontend (drm-lease-v1); the display is acquired through
+// VK_EXT_acquire_drm_display and driven directly, bypassing the window system.
+static vk::SurfaceKHR CreateDrmDisplaySurface(vk::Instance instance,
+                                              const Frontend::EmuWindow::WindowSystemInfo& info) {
+    if (info.drm_lease_fd < 0) {
+        LOG_CRITICAL(Render_Vulkan, "Drm window has no lease fd");
+        return {};
+    }
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDrmDisplayEXT ||
+        !VULKAN_HPP_DEFAULT_DISPATCHER.vkAcquireDrmDisplayEXT) {
+        LOG_CRITICAL(Render_Vulkan, "VK_EXT_acquire_drm_display is not supported by this driver");
+        return {};
+    }
+
+    try {
+        const auto physical_devices = instance.enumeratePhysicalDevices();
+        const u32 device_index = std::min(Settings::values.physical_device.GetValue(),
+                                          static_cast<u32>(physical_devices.size() - 1));
+        const vk::PhysicalDevice physical_device = physical_devices[device_index];
+
+        const vk::DisplayKHR display =
+            physical_device.getDrmDisplayEXT(info.drm_lease_fd, info.drm_connector_id);
+        physical_device.acquireDrmDisplayEXT(info.drm_lease_fd, display);
+
+        // The frontend sized its framebuffer from the DRM preferred mode;
+        // Vulkan does not order this list, so match it explicitly.
+        const auto modes = physical_device.getDisplayModePropertiesKHR(display);
+        if (modes.empty()) {
+            LOG_CRITICAL(Render_Vulkan, "Leased display has no modes");
+            return {};
+        }
+        const auto mode_it =
+            std::find_if(modes.begin(), modes.end(), [&](const vk::DisplayModePropertiesKHR& m) {
+                return m.parameters.visibleRegion.width == info.drm_mode_width &&
+                       m.parameters.visibleRegion.height == info.drm_mode_height;
+            });
+        if (mode_it == modes.end()) {
+            LOG_CRITICAL(Render_Vulkan, "Leased display has no {}x{} mode", info.drm_mode_width,
+                         info.drm_mode_height);
+            return {};
+        }
+        const vk::DisplayModePropertiesKHR mode = *mode_it;
+
+        const auto displays = physical_device.getDisplayPropertiesKHR();
+        const auto display_it =
+            std::find_if(displays.begin(), displays.end(),
+                         [&](const vk::DisplayPropertiesKHR& d) { return d.display == display; });
+        if (display_it == displays.end() ||
+            !(display_it->supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity)) {
+            LOG_CRITICAL(Render_Vulkan, "Leased display does not support the identity transform");
+            return {};
+        }
+
+        const auto planes = physical_device.getDisplayPlanePropertiesKHR();
+        std::optional<u32> plane_index;
+        for (u32 i = 0; i < planes.size(); i++) {
+            if (planes[i].currentDisplay && planes[i].currentDisplay != display) {
+                continue;
+            }
+            const auto supported = physical_device.getDisplayPlaneSupportedDisplaysKHR(i);
+            if (std::find(supported.begin(), supported.end(), display) != supported.end()) {
+                plane_index = i;
+                break;
+            }
+        }
+        if (!plane_index) {
+            LOG_CRITICAL(Render_Vulkan, "No display plane supports the leased display");
+            return {};
+        }
+
+        const auto plane_caps =
+            physical_device.getDisplayPlaneCapabilitiesKHR(mode.displayMode, *plane_index);
+        vk::DisplayPlaneAlphaFlagBitsKHR alpha_mode{};
+        bool alpha_found = false;
+        for (const auto candidate :
+             {vk::DisplayPlaneAlphaFlagBitsKHR::eOpaque, vk::DisplayPlaneAlphaFlagBitsKHR::eGlobal,
+              vk::DisplayPlaneAlphaFlagBitsKHR::ePerPixel,
+              vk::DisplayPlaneAlphaFlagBitsKHR::ePerPixelPremultiplied}) {
+            if (plane_caps.supportedAlpha & candidate) {
+                alpha_mode = candidate;
+                alpha_found = true;
+                break;
+            }
+        }
+        if (!alpha_found) {
+            LOG_CRITICAL(Render_Vulkan, "Leased display plane advertises no alpha mode");
+            return {};
+        }
+
+        const vk::DisplaySurfaceCreateInfoKHR display_ci = {
+            .displayMode = mode.displayMode,
+            .planeIndex = *plane_index,
+            .planeStackIndex = planes[*plane_index].currentStackIndex,
+            .transform = vk::SurfaceTransformFlagBitsKHR::eIdentity,
+            .globalAlpha = 1.0f,
+            .alphaMode = alpha_mode,
+            .imageExtent = mode.parameters.visibleRegion,
+        };
+
+        vk::SurfaceKHR surface{};
+        const vk::Result res =
+            instance.createDisplayPlaneSurfaceKHR(&display_ci, nullptr, &surface);
+        if (res != vk::Result::eSuccess) {
+            LOG_CRITICAL(Render_Vulkan, "vkCreateDisplayPlaneSurfaceKHR failed: {}",
+                         vk::to_string(res));
+            return {};
+        }
+
+        LOG_INFO(Render_Vulkan, "Created DRM display surface: connector {} mode {}x{} plane {}",
+                 info.drm_connector_id, mode.parameters.visibleRegion.width,
+                 mode.parameters.visibleRegion.height, *plane_index);
+        return surface;
+    } catch (const vk::Error& err) {
+        LOG_CRITICAL(Render_Vulkan, "DRM display surface creation raised: {}", err.what());
+        return {};
+    }
+}
+
 vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::EmuWindow& emu_window) {
     const auto& window_info = emu_window.GetWindowInfo();
     vk::SurfaceKHR surface{};
     vk::Result res;
+
+    if (window_info.type == Frontend::WindowSystemType::Drm) {
+        return CreateDrmDisplaySurface(instance, window_info);
+    }
 
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
     if (window_info.type == Frontend::WindowSystemType::Windows) {
@@ -206,7 +331,8 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::EmuWindow& e
 }
 
 std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window_type,
-                                               bool enable_debug_utils) {
+                                               bool enable_debug_utils,
+                                               bool enable_drm_display = false) {
     const auto properties = vk::enumerateInstanceExtensionProperties();
     if (properties.empty()) {
         LOG_ERROR(Render_Vulkan, "Failed to query extension properties");
@@ -255,6 +381,13 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
     }
 
+    // Direct-to-display presentation on a leased DRM connector.
+    if (enable_drm_display) {
+        extensions.push_back(VK_KHR_DISPLAY_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_DIRECT_MODE_DISPLAY_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_ACQUIRE_DRM_DISPLAY_EXTENSION_NAME);
+    }
+
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
@@ -287,7 +420,7 @@ vk::InstanceCreateFlags GetInstanceFlags() {
 
 vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
                                   Frontend::WindowSystemType window_type, bool enable_validation,
-                                  bool dump_command_buffers) {
+                                  bool dump_command_buffers, bool enable_drm_display) {
     if (!library.IsLoaded()) {
         throw std::runtime_error("Failed to load Vulkan driver library");
     }
@@ -309,7 +442,8 @@ vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
             VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version)));
     }
 
-    const auto extensions = GetInstanceExtensions(window_type, enable_validation);
+    const auto extensions =
+        GetInstanceExtensions(window_type, enable_validation, enable_drm_display);
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "Citra",

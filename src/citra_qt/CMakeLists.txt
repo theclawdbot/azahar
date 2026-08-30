@@ -360,6 +360,59 @@ if (ENABLE_WEB_SERVICE)
     target_link_libraries(citra_qt PRIVATE web_service)
 endif()
 
+# Secondary screen on a DRM lease (drm-lease-v1 + VK_KHR_display + evdev touch).
+# Linux only; requires wayland-client, wayland-protocols, wayland-scanner, libdrm.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_VULKAN)
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+        pkg_check_modules(LIBDRM IMPORTED_TARGET libdrm)
+        pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
+    endif()
+
+    if (WAYLAND_CLIENT_FOUND AND LIBDRM_FOUND AND WAYLAND_SCANNER)
+        # Vendored copy of the wayland-protocols staging XML so builds do not
+        # need wayland-protocols installed.
+        set(DRM_LEASE_XML "${CMAKE_CURRENT_SOURCE_DIR}/drm_lease/drm-lease-v1.xml")
+        set(DRM_LEASE_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/drm_lease")
+        file(MAKE_DIRECTORY "${DRM_LEASE_GEN_DIR}")
+        add_custom_command(
+            OUTPUT "${DRM_LEASE_GEN_DIR}/drm-lease-v1-client-protocol.h"
+                   "${DRM_LEASE_GEN_DIR}/drm-lease-v1-protocol.c"
+            COMMAND "${WAYLAND_SCANNER}" client-header "${DRM_LEASE_XML}"
+                    "${DRM_LEASE_GEN_DIR}/drm-lease-v1-client-protocol.h"
+            COMMAND "${WAYLAND_SCANNER}" private-code "${DRM_LEASE_XML}"
+                    "${DRM_LEASE_GEN_DIR}/drm-lease-v1-protocol.c"
+            DEPENDS "${DRM_LEASE_XML}"
+            VERBATIM
+        )
+        # Separate C-only library so the generated protocol code stays out of
+        # citra_qt's C++ precompiled headers.
+        add_library(drm_lease_protocol STATIC
+            "${DRM_LEASE_GEN_DIR}/drm-lease-v1-protocol.c"
+            "${DRM_LEASE_GEN_DIR}/drm-lease-v1-client-protocol.h"
+        )
+        target_link_libraries(drm_lease_protocol PRIVATE PkgConfig::WAYLAND_CLIENT)
+
+        target_sources(citra_qt PRIVATE
+            drm_lease/drm_lease_client.cpp
+            drm_lease/drm_lease_client.h
+            drm_lease/drm_lease_touch.cpp
+            drm_lease/drm_lease_touch.h
+            drm_lease/drm_lease_window.cpp
+            drm_lease/drm_lease_window.h
+        )
+        target_include_directories(citra_qt PRIVATE "${DRM_LEASE_GEN_DIR}")
+        target_link_libraries(citra_qt PRIVATE drm_lease_protocol PkgConfig::WAYLAND_CLIENT
+                                               PkgConfig::LIBDRM)
+        add_dependencies(citra_qt drm_lease_protocol)
+        target_compile_definitions(citra_qt PRIVATE -DENABLE_DRM_LEASE)
+        message(STATUS "DRM lease secondary screen support enabled")
+    else()
+        message(STATUS "DRM lease secondary screen support disabled (missing wayland/libdrm)")
+    endif()
+endif()
+
 if (CITRA_USE_PRECOMPILED_HEADERS)
     target_precompile_headers(citra_qt PRIVATE precompiled_headers.h)
 endif()

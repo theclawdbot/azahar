@@ -45,6 +45,10 @@ class GraphicsBreakPointsWidget;
 class GraphicsTracingWidget;
 class GraphicsVertexShaderWidget;
 class GRenderWindow;
+
+namespace Frontend {
+class DrmLeaseWindow;
+}
 class IPCRecorderWidget;
 class LLEServiceModulesWidget;
 class LoadingScreen;
@@ -348,6 +352,10 @@ private:
 
     GRenderWindow* render_window;
     GRenderWindow* secondary_window;
+#ifdef ENABLE_DRM_LEASE
+    std::unique_ptr<Frontend::DrmLeaseWindow> drm_lease_window;
+    Settings::LayoutOption drm_lease_saved_layout{};
+#endif
 
     GameListPlaceholder* game_list_placeholder;
     LoadingScreen* loading_screen;

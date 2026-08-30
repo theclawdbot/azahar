@@ -40,7 +40,8 @@ class Instance {
 public:
     struct NoInit {};
     explicit Instance(bool validation = false, bool dump_command_buffers = false);
-    explicit Instance(Frontend::EmuWindow& window, u32 physical_device_index);
+    explicit Instance(Frontend::EmuWindow& window, u32 physical_device_index,
+                      bool enable_drm_display = false);
     explicit Instance(NoInit) {} // For LibRetro inheritance - does minimal setup
     virtual ~Instance();
 

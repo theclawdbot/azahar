@@ -42,6 +42,9 @@
 #include "citra_qt/applets/mii_selector.h"
 #include "citra_qt/applets/swkbd.h"
 #include "citra_qt/bootmanager.h"
+#ifdef ENABLE_DRM_LEASE
+#include "citra_qt/drm_lease/drm_lease_window.h"
+#endif
 #include "citra_qt/camera/qt_multimedia_camera.h"
 #include "citra_qt/camera/still_image_camera.h"
 #include "citra_qt/citra_qt.h"
@@ -1365,16 +1368,64 @@ bool GMainWindow::LoadROM(const QString& filename) {
         return false;
     }
 
+#ifdef ENABLE_DRM_LEASE
+    // Route the bottom screen to a leased DRM connector when the compositor
+    // offers one via drm-lease-v1. Auto-selection takes internal panels only;
+    // AZAHAR_DRM_LEASE_CONNECTOR targets any connector, AZAHAR_DRM_LEASE=0
+    // disables.
+    drm_lease_window.reset();
+    const char* lease_env = std::getenv("AZAHAR_DRM_LEASE");
+    if (!(lease_env && std::strcmp(lease_env, "0") == 0) &&
+        Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::Vulkan) {
+        const char* connector = std::getenv("AZAHAR_DRM_LEASE_CONNECTOR");
+        const char* rotation_env = std::getenv("AZAHAR_DRM_LEASE_ROTATION");
+        const char* touch_device = std::getenv("AZAHAR_DRM_LEASE_TOUCH");
+        const bool explicit_connector = connector && connector[0] != '\0';
+        const int rotation = rotation_env ? std::atoi(rotation_env) : -1;
+
+        auto window = std::make_unique<Frontend::DrmLeaseWindow>();
+        if (window->Initialize(explicit_connector ? connector : "", rotation,
+                               touch_device ? touch_device : "auto", !explicit_connector)) {
+            drm_lease_window = std::move(window);
+            drm_lease_saved_layout = Settings::values.layout_option.GetValue();
+            Settings::values.layout_option.SetValue(Settings::LayoutOption::SeparateWindows);
+            // The Qt windows computed their layouts before the override.
+            render_window->OnFramebufferSizeChanged();
+            secondary_window->OnFramebufferSizeChanged();
+            LOG_INFO(Frontend, "Bottom screen routed to DRM lease output");
+        } else if (explicit_connector) {
+            LOG_ERROR(Frontend, "DRM lease connector '{}' unavailable, using the Qt window",
+                      connector);
+        }
+    }
+#endif
+
     const auto scope = render_window->Acquire();
 
     if (!UISettings::values.inserted_cartridge.GetValue().empty()) {
         system.InsertCartridge(UISettings::values.inserted_cartridge.GetValue());
     }
 
+    Frontend::EmuWindow* secondary_emu_window = secondary_window;
+#ifdef ENABLE_DRM_LEASE
+    if (drm_lease_window) {
+        secondary_emu_window = drm_lease_window.get();
+    }
+#endif
     const Core::System::ResultStatus result{
-        system.Load(*render_window, filename.toStdString(), secondary_window)};
+        system.Load(*render_window, filename.toStdString(), secondary_emu_window)};
 
     if (result != Core::System::ResultStatus::Success) {
+#ifdef ENABLE_DRM_LEASE
+        // Emulation never starts, so ShutdownGame will not release the lease
+        // or the touch grab, and the layout override must not stick.
+        if (drm_lease_window) {
+            drm_lease_window.reset();
+            Settings::values.layout_option.SetValue(drm_lease_saved_layout);
+            render_window->OnFramebufferSizeChanged();
+            secondary_window->OnFramebufferSizeChanged();
+        }
+#endif
         QString invalid_format = tr("Invalid application format");
         QString invalid_format_description =
             tr("The application file format not supported.<br>Please make sure you are using one "
@@ -1685,6 +1736,13 @@ void GMainWindow::ShutdownGame() {
 
     render_window->hide();
     secondary_window->hide();
+#ifdef ENABLE_DRM_LEASE
+    // Return the lease (and the touch grab) to the compositor.
+    if (drm_lease_window) {
+        drm_lease_window.reset();
+        Settings::values.layout_option.SetValue(drm_lease_saved_layout);
+    }
+#endif
     loading_screen->hide();
     loading_screen->Clear();
 
@@ -2780,6 +2838,12 @@ void GMainWindow::UpdateSecondaryWindowVisibility() {
     if (!emulation_running) {
         return;
     }
+#ifdef ENABLE_DRM_LEASE
+    if (drm_lease_window) {
+        secondary_window->hide();
+        return;
+    }
+#endif
     if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
         secondary_window->restoreGeometry(UISettings::values.secondarywindow_geometry);
         secondary_window->show();

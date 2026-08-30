@@ -187,6 +187,11 @@ bool EmuWindow::TouchPressed(unsigned framebuffer_x, unsigned framebuffer_y) {
         touch_state->touch_x = 1.f - touch_state->touch_x;
     }
 
+    if (framebuffer_layout.is_flipped) {
+        touch_state->touch_x = 1.f - touch_state->touch_x;
+        touch_state->touch_y = 1.f - touch_state->touch_y;
+    }
+
     touch_state->touch_pressed = true;
     return true;
 }
@@ -199,8 +204,11 @@ void EmuWindow::TouchReleased() {
 }
 
 void EmuWindow::TouchMoved(unsigned framebuffer_x, unsigned framebuffer_y) {
-    if (!touch_state->touch_pressed)
-        return;
+    {
+        std::scoped_lock guard{touch_state->mutex};
+        if (!touch_state->touch_pressed)
+            return;
+    }
 
     if (!IsWithinTouchscreen(framebuffer_layout, framebuffer_x, framebuffer_y))
         std::tie(framebuffer_x, framebuffer_y) = ClipToTouchScreen(framebuffer_x, framebuffer_y);

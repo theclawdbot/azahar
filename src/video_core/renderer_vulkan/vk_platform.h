@@ -31,7 +31,7 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::EmuWindow& e
 
 vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
                                   Frontend::WindowSystemType window_type, bool enable_validation,
-                                  bool dump_command_buffers);
+                                  bool dump_command_buffers, bool enable_drm_display = false);
 
 DebugCallback CreateDebugCallback(vk::Instance instance, bool& debug_utils_supported);
 

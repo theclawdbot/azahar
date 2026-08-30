@@ -110,8 +110,10 @@ static bool IsLowRefreshRate() {
 RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
                                Frontend::EmuWindow& window, Frontend::EmuWindow* secondary_window)
     : RendererBase{system, window, secondary_window}, memory{system.Memory()}, pica{pica_},
-      instance{window, Settings::values.physical_device.GetValue()}, scheduler{instance},
-      renderpass_cache{instance, scheduler},
+      instance{window, Settings::values.physical_device.GetValue(),
+               secondary_window &&
+                   secondary_window->GetWindowInfo().type == Frontend::WindowSystemType::Drm},
+      scheduler{instance}, renderpass_cache{instance, scheduler},
       main_present_window{window, instance, scheduler, IsLowRefreshRate()},
       vertex_buffer{instance, scheduler, vk::BufferUsageFlagBits::eVertexBuffer,
                     VERTEX_BUFFER_SIZE},
@@ -908,8 +910,11 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     const float top_screen_width = static_cast<float>(top_screen.GetWidth());
     const float top_screen_height = static_cast<float>(top_screen.GetHeight());
 
-    const auto orientation = layout.is_rotated ? Layout::DisplayOrientation::Landscape
-                                               : Layout::DisplayOrientation::Portrait;
+    const auto orientation = layout.is_rotated
+                                 ? (layout.is_flipped ? Layout::DisplayOrientation::LandscapeFlipped
+                                                      : Layout::DisplayOrientation::Landscape)
+                                 : (layout.is_flipped ? Layout::DisplayOrientation::PortraitFlipped
+                                                      : Layout::DisplayOrientation::Portrait);
     switch (layout.render_3d_mode) {
     case Settings::StereoRenderOption::Off: {
         const int eye = static_cast<int>(Settings::values.mono_render_option.GetValue());
@@ -964,8 +969,11 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     const float bottom_screen_width = static_cast<float>(bottom_screen.GetWidth());
     const float bottom_screen_height = static_cast<float>(bottom_screen.GetHeight());
 
-    const auto orientation = layout.is_rotated ? Layout::DisplayOrientation::Landscape
-                                               : Layout::DisplayOrientation::Portrait;
+    const auto orientation = layout.is_rotated
+                                 ? (layout.is_flipped ? Layout::DisplayOrientation::LandscapeFlipped
+                                                      : Layout::DisplayOrientation::Landscape)
+                                 : (layout.is_flipped ? Layout::DisplayOrientation::PortraitFlipped
+                                                      : Layout::DisplayOrientation::Portrait);
 
     switch (layout.render_3d_mode) {
     case Settings::StereoRenderOption::Off: {

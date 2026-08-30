@@ -28,6 +28,7 @@ enum class WindowSystemType : u8 {
     X11,
     Wayland,
     LibRetro,
+    Drm,
 };
 
 struct Frame;
@@ -163,6 +164,14 @@ public:
 
         // Scale of the render surface. For hidpi systems, this will be >1.
         float render_surface_scale = 1.0f;
+
+        // For WindowSystemType::Drm: the DRM lease fd, the leased connector
+        // to drive, and its chosen mode. The fd is owned by the frontend and
+        // must stay valid for the lifetime of the window.
+        int drm_lease_fd = -1;
+        u32 drm_connector_id = 0;
+        u32 drm_mode_width = 0;
+        u32 drm_mode_height = 0;
     };
 
     /// Polls window events
@@ -251,8 +260,8 @@ public:
      * Convenience method to update the current frame layout
      * Read from the current settings to determine which layout to use.
      */
-    void UpdateCurrentFramebufferLayout(unsigned width, unsigned height,
-                                        bool is_portrait_mode = {});
+    virtual void UpdateCurrentFramebufferLayout(unsigned width, unsigned height,
+                                                bool is_portrait_mode = {});
 
     std::unique_ptr<TextureMailbox> mailbox = nullptr;
     bool isSecondary() const {

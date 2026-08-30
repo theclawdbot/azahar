@@ -41,6 +41,10 @@ struct FramebufferLayout {
     bool additional_screen_is_bottom = false;
     Common::Rectangle<u32> additional_screen;
     CardboardSettings cardboard;
+    // Rotate the rendered output another 180 degrees, for direct-driven
+    // panels mounted opposite to the layout's rotation direction. Kept out
+    // of the positionally initialized members above.
+    bool is_flipped = false;
 
     /**
      * Returns the ratio of pixel size of the top screen, compared to the native size of the 3DS
