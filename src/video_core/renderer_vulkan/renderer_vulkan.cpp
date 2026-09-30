@@ -322,11 +322,14 @@ void RendererVulkan::PresentDumbBottomScreen() {
     }
 
     if (log_kms_frame) {
+        const u32 format_value =
+            static_cast<u32>(static_cast<Pica::PixelFormat>(framebuffer.color_format));
+        const bool fill_enabled = static_cast<bool>(color_fill.is_enabled);
         LOG_INFO(Render_Vulkan,
                  "KMS bottom frame {} addr={:#010x} {}x{} stride={} format={} fill={} raw_nonzero={} raw_checksum={:#016x} decoded_nonblack={}",
-                 kms_debug_frame, framebuffer_addr, fb_width, fb_height, framebuffer.stride,
-                 static_cast<u32>(static_cast<Pica::PixelFormat>(framebuffer.color_format)),
-                 color_fill.is_enabled, raw_nonzero, raw_checksum, decoded_nonblack);
+                 kms_debug_frame, framebuffer_addr, fb_width, fb_height,
+                 static_cast<u32>(framebuffer.stride), format_value, fill_enabled, raw_nonzero,
+                 raw_checksum, decoded_nonblack);
     }
     kms_debug_frame++;
 
