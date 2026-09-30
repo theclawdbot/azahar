@@ -37,7 +37,8 @@ struct Frame {
 class PresentWindow final {
 public:
     explicit PresentWindow(Frontend::EmuWindow& emu_window, const Instance& instance,
-                           Scheduler& scheduler, bool low_refresh_rate);
+                           Scheduler& scheduler, bool low_refresh_rate,
+                           bool force_synchronous = false);
     ~PresentWindow();
 
     /// Waits for all queued frames to finish presenting.

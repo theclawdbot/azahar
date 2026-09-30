@@ -114,7 +114,9 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
                secondary_window &&
                    secondary_window->GetWindowInfo().type == Frontend::WindowSystemType::Drm},
       scheduler{instance}, renderpass_cache{instance, scheduler},
-      main_present_window{window, instance, scheduler, IsLowRefreshRate()},
+      main_present_window{window, instance, scheduler, IsLowRefreshRate(),
+                          secondary_window && secondary_window->GetWindowInfo().type ==
+                                                  Frontend::WindowSystemType::Drm},
       vertex_buffer{instance, scheduler, vk::BufferUsageFlagBits::eVertexBuffer,
                     VERTEX_BUFFER_SIZE},
       update_queue{instance}, rasterizer{memory,

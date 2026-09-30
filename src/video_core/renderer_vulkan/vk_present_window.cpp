@@ -98,7 +98,8 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, vk::Format fo
 } // Anonymous namespace
 
 PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& instance_,
-                             Scheduler& scheduler_, bool low_refresh_rate_)
+                             Scheduler& scheduler_, bool low_refresh_rate_,
+                             bool force_synchronous)
     : emu_window{emu_window_}, instance{instance_}, scheduler{scheduler_},
       low_refresh_rate{low_refresh_rate_},
       surface{CreateSurface(instance.GetInstance(), emu_window)}, next_surface{surface},
@@ -112,7 +113,7 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       // surface. Turnip can fault inside vkQueuePresentKHR when that swapchain is presented from
       // Azahar's background presentation thread. Keep the leased output on the render thread while
       // preserving asynchronous presentation for regular X11/Wayland windows.
-      use_present_thread{Settings::values.async_presentation.GetValue() &&
+      use_present_thread{Settings::values.async_presentation.GetValue() && !force_synchronous &&
                          emu_window.GetWindowInfo().type != Frontend::WindowSystemType::Drm},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
 
