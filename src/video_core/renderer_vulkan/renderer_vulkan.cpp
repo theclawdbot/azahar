@@ -325,8 +325,8 @@ void RendererVulkan::PresentDumbBottomScreen() {
         LOG_INFO(Render_Vulkan,
                  "KMS bottom frame {} addr={:#010x} {}x{} stride={} format={} fill={} raw_nonzero={} raw_checksum={:#016x} decoded_nonblack={}",
                  kms_debug_frame, framebuffer_addr, fb_width, fb_height, framebuffer.stride,
-                 static_cast<u32>(framebuffer.color_format), color_fill.is_enabled, raw_nonzero,
-                 raw_checksum, decoded_nonblack);
+                 static_cast<u32>(static_cast<Pica::PixelFormat>(framebuffer.color_format)),
+                 color_fill.is_enabled, raw_nonzero, raw_checksum, decoded_nonblack);
     }
     kms_debug_frame++;
 
