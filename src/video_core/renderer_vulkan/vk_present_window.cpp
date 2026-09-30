@@ -108,8 +108,18 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       vsync_enabled{Settings::values.use_vsync.GetValue()},
       blit_supported{
           CanBlitToSwapchain(instance.GetPhysicalDevice(), swapchain.GetSurfaceFormat().format)},
-      use_present_thread{Settings::values.async_presentation.GetValue()},
+      // Direct-display swapchains are driven through VK_KHR_display rather than a window-system
+      // surface. Turnip can fault inside vkQueuePresentKHR when that swapchain is presented from
+      // Azahar's background presentation thread. Keep the leased output on the render thread while
+      // preserving asynchronous presentation for regular X11/Wayland windows.
+      use_present_thread{Settings::values.async_presentation.GetValue() &&
+                         emu_window.GetWindowInfo().type != Frontend::WindowSystemType::Drm},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
+
+    LOG_INFO(Render_Vulkan, "Presentation thread for {} output: {}",
+             emu_window.GetWindowInfo().type == Frontend::WindowSystemType::Drm ? "DRM lease"
+                                                                               : "window-system",
+             use_present_thread ? "enabled" : "disabled");
 
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
