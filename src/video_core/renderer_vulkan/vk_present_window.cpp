@@ -116,6 +116,13 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
                          emu_window.GetWindowInfo().type != Frontend::WindowSystemType::Drm},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
 
+    const bool surface_presentable = instance.GetPhysicalDevice().getSurfaceSupportKHR(
+        instance.GetPresentQueueFamilyIndex(), surface);
+    LOG_INFO(Render_Vulkan, "{} surface presentable from queue family {}: {}",
+             emu_window.GetWindowInfo().type == Frontend::WindowSystemType::Drm ? "DRM lease"
+                                                                               : "Window-system",
+             instance.GetPresentQueueFamilyIndex(), surface_presentable);
+
     LOG_INFO(Render_Vulkan, "Presentation thread for {} output: {}",
              emu_window.GetWindowInfo().type == Frontend::WindowSystemType::Drm ? "DRM lease"
                                                                                : "window-system",

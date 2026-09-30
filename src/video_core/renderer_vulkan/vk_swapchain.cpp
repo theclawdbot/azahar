@@ -128,8 +128,12 @@ void Swapchain::Present() {
     };
 
     MICROPROFILE_SCOPE(Vulkan_Present);
+    LOG_INFO(Render_Vulkan,
+             "Calling vkQueuePresentKHR: image={} extent={}x{} mode={} format={}", image_index,
+             extent.width, extent.height, vk::to_string(present_mode), vk::to_string(surface_format.format));
     try {
-        [[maybe_unused]] vk::Result result = instance.GetPresentQueue().presentKHR(present_info);
+        const vk::Result result = instance.GetPresentQueue().presentKHR(present_info);
+        LOG_INFO(Render_Vulkan, "vkQueuePresentKHR returned {}", vk::to_string(result));
     } catch (vk::OutOfDateKHRError&) {
         needs_recreation = true;
         return;
