@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/assert.h"
+#include "common/color.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
 #include "common/microprofile.h"
@@ -23,6 +24,7 @@
 #include "video_core/host_shaders/vulkan_cursor_frag.h"
 #include "video_core/host_shaders/vulkan_cursor_vert.h"
 
+#include <limits>
 #include <vk_mem_alloc.h>
 #if defined(__APPLE__) && !defined(HAVE_LIBRETRO)
 #include "common/apple_utils.h"
@@ -191,6 +193,127 @@ void RendererVulkan::PrepareRendertarget() {
 
         LoadFBToScreenInfo(framebuffer, screen_infos[i], i == 1);
     }
+}
+
+void RendererVulkan::PresentDumbBottomScreen() {
+    if (!secondary_window ||
+        secondary_window->GetWindowInfo().type != Frontend::WindowSystemType::Headless) {
+        return;
+    }
+
+    const auto& framebuffer = pica.regs.framebuffer_config[1];
+    const auto& color_fill = pica.regs_lcd.color_fill_bottom;
+
+    const u32 fb_width = framebuffer.width;
+    const u32 fb_height = framebuffer.height;
+    if (fb_width == 0 || fb_height == 0 || fb_width > 1024 || fb_height > 1024) {
+        return;
+    }
+
+    const u32 bpp = [&] {
+        switch (framebuffer.color_format) {
+        case Pica::PixelFormat::RGBA8:
+            return 4u;
+        case Pica::PixelFormat::RGB8:
+            return 3u;
+        case Pica::PixelFormat::RGB565:
+        case Pica::PixelFormat::RGB5A1:
+        case Pica::PixelFormat::RGBA4:
+            return 2u;
+        default:
+            return 0u;
+        }
+    }();
+    if (bpp == 0 || framebuffer.stride < fb_width * bpp || (framebuffer.stride % bpp) != 0) {
+        return;
+    }
+    const u32 pixel_stride = framebuffer.stride / bpp;
+    const u64 framebuffer_size = static_cast<u64>(framebuffer.stride) * fb_height;
+    if (framebuffer_size == 0 || framebuffer_size > std::numeric_limits<u32>::max()) {
+        return;
+    }
+
+    const PAddr framebuffer_addr =
+        framebuffer.active_fb == 0 ? framebuffer.address_left1 : framebuffer.address_left2;
+    const u64 framebuffer_end = static_cast<u64>(framebuffer_addr) + framebuffer_size;
+    const auto contained_in = [framebuffer_addr, framebuffer_end](PAddr start, PAddr end) {
+        return framebuffer_addr >= start && framebuffer_end <= static_cast<u64>(end);
+    };
+    const bool contiguous =
+        contained_in(Memory::VRAM_PADDR, Memory::VRAM_PADDR_END) ||
+        contained_in(Memory::N3DS_EXTRA_RAM_PADDR, Memory::N3DS_EXTRA_RAM_PADDR_END) ||
+        contained_in(Memory::DSP_RAM_PADDR, Memory::DSP_RAM_PADDR_END) ||
+        contained_in(Memory::FCRAM_PADDR, Memory::FCRAM_N3DS_PADDR_END);
+    if (!contiguous) {
+        return;
+    }
+
+    const u8* framebuffer_data = nullptr;
+    if (!color_fill.is_enabled) {
+        // Accelerated display transfers may leave the guest framebuffer dirty in
+        // the Vulkan rasterizer cache. Flush it to emulated memory before the CPU
+        // decoder reads it, then wait for the transfer to complete.
+        rasterizer.FlushRegion(framebuffer_addr, static_cast<u32>(framebuffer_size));
+        scheduler.Finish();
+        framebuffer_data = memory.GetPhysicalPointer(framebuffer_addr);
+        if (!framebuffer_data) {
+            return;
+        }
+    }
+
+    // The 3DS LCD buffer is portrait-oriented (240x320), while the emulated
+    // bottom screen is landscape (320x240). Match RendererSoftware's proven
+    // transpose: display (dx,dy) reads guest (x=dy,y=dx).
+    const u32 output_width = fb_height;
+    const u32 output_height = fb_width;
+    cpu_bottom_frame.resize(static_cast<std::size_t>(output_width) * output_height * 4);
+    for (u32 dy = 0; dy < output_height; dy++) {
+        for (u32 dx = 0; dx < output_width; dx++) {
+            Common::Vec4<u8> color;
+            if (color_fill.is_enabled) {
+                color = Common::Vec4<u8>(static_cast<u8>(color_fill.color_r),
+                                         static_cast<u8>(color_fill.color_g),
+                                         static_cast<u8>(color_fill.color_b), 255);
+            } else {
+                const u8* pixel =
+                    framebuffer_data +
+                    (static_cast<std::size_t>(dx) * pixel_stride + (pixel_stride - dy - 1)) * bpp;
+                switch (framebuffer.color_format) {
+                case Pica::PixelFormat::RGBA8:
+                    color = Common::Color::DecodeRGBA8(pixel);
+                    break;
+                case Pica::PixelFormat::RGB8:
+                    color = Common::Color::DecodeRGB8(pixel);
+                    break;
+                case Pica::PixelFormat::RGB565:
+                    color = Common::Color::DecodeRGB565(pixel);
+                    break;
+                case Pica::PixelFormat::RGB5A1:
+                    color = Common::Color::DecodeRGB5A1(pixel);
+                    break;
+                case Pica::PixelFormat::RGBA4:
+                    color = Common::Color::DecodeRGBA4(pixel);
+                    break;
+                default:
+                    color = {};
+                    break;
+                }
+            }
+            u8* dest = cpu_bottom_frame.data() +
+                       (static_cast<std::size_t>(dy) * output_width + dx) * 4;
+            dest[0] = color.r();
+            dest[1] = color.g();
+            dest[2] = color.b();
+            dest[3] = color.a();
+        }
+    }
+
+    const auto& layout = secondary_window->GetFramebufferLayout();
+    // The CPU decoder already transposed the portrait guest framebuffer into
+    // a normal 320x240 landscape image. Apply only the panel's physical
+    // orientation here (90 for Side Up, plus 180 for the 270-degree case).
+    secondary_window->PresentCpuFrame(cpu_bottom_frame.data(), output_width, output_height, true,
+                                      layout.is_flipped);
 }
 
 void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
@@ -1166,6 +1289,7 @@ void RendererVulkan::SwapBuffers() {
 
     const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
     PrepareRendertarget();
+    PresentDumbBottomScreen();
     RenderScreenshot();
     isSecondaryWindow = false;
     RenderToWindow(main_present_window, layout, false);

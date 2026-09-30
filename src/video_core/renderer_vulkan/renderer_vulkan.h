@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <vector>
 #include "common/common_types.h"
 #include "common/math_util.h"
 #include "video_core/renderer_base.h"
@@ -92,6 +93,7 @@ private:
                                      const Pica::FramebufferConfig& framebuffer);
     void ConfigureRenderPipeline();
     void PrepareRendertarget();
+    void PresentDumbBottomScreen();
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();
@@ -143,6 +145,7 @@ private:
     u32 current_pipeline = 0;
 
     std::array<ScreenInfo, 3> screen_infos{};
+    std::vector<u8> cpu_bottom_frame;
     PresentUniformData draw_info{};
     vk::ClearColorValue clear_color{};
 

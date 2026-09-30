@@ -41,6 +41,11 @@ public:
     void UpdateCurrentFramebufferLayout(unsigned width, unsigned height,
                                         bool is_portrait_mode = {}) override;
 
+    // Scales a decoded bottom-screen frame into the persistent dumb buffer.
+    // A no-op unless AZAHAR_DRM_LEASE_DUMB_PROOF latched the scanout.
+    void PresentCpuFrame(const u8* pixels, u32 width, u32 height, bool rotate90,
+                         bool flip180) override;
+
 private:
     std::unique_ptr<DrmLeaseClient> client;
     // Holds the latched dumb framebuffer for AZAHAR_DRM_LEASE_DUMB_PROOF.

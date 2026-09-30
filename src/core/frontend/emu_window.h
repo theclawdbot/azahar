@@ -278,6 +278,14 @@ public:
         return true;
     }
 
+    /// Optional CPU scanout for frontends that own a host framebuffer (the DRM
+    /// dumb-buffer proof). Default is a no-op so windowed backends stay unchanged.
+    /// pixels is tightly packed RGBA8, row-major, origin top-left of the source
+    /// image. rotate90/flip180 follow the frontend layout convention.
+    virtual void PresentCpuFrame([[maybe_unused]] const u8* pixels, [[maybe_unused]] u32 width,
+                                 [[maybe_unused]] u32 height, [[maybe_unused]] bool rotate90,
+                                 [[maybe_unused]] bool flip180) {}
+
     /// Cursor state for rendering a touch crosshair on the bottom screen.
     struct CursorInfo {
         bool visible = false;

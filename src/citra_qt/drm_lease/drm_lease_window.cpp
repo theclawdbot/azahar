@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -359,21 +360,80 @@ private:
 
         if ((creq.pitch % sizeof(u32)) != 0) {
             LOG_ERROR(Frontend, "drm-lease: dumb proof invalid pitch {}", creq.pitch);
+            munmap(map, creq.size);
             return false;
         }
 
+        mapped = static_cast<u8*>(map);
+        mapped_size = creq.size;
+        pitch = creq.pitch;
+        width = creq.width;
+        height = creq.height;
+
         // XRGB8888 and ARGB8888 are both little-endian A:R:G:B. Alpha is 0xff
         // so an ARGB-only plane is still opaque orange (0x00ff4020 is XRGB).
+        // The mapping stays for the lifetime of the proof so later CPU frames
+        // can replace this latch without another modeset.
         const u32 pixel = format == DRM_FORMAT_ARGB8888 ? 0xffff4020u : 0x00ff4020u;
-        auto* rows = static_cast<u8*>(map);
-        for (u32 y = 0; y < creq.height; y++) {
-            auto* row = reinterpret_cast<u32*>(rows + static_cast<u64>(y) * creq.pitch);
-            for (u32 x = 0; x < creq.width; x++) {
+        for (u32 y = 0; y < height; y++) {
+            auto* row = reinterpret_cast<u32*>(mapped + static_cast<u64>(y) * pitch);
+            for (u32 x = 0; x < width; x++) {
                 row[x] = pixel;
             }
         }
-        munmap(map, creq.size);
         return true;
+    }
+
+public:
+    void Present(const u8* pixels, u32 src_width, u32 src_height, bool rotate90, bool flip180) {
+        if (!mapped || !pixels || src_width == 0 || src_height == 0 || pitch < width * sizeof(u32) ||
+            static_cast<u64>(pitch) * height > mapped_size) {
+            return;
+        }
+
+        const u32 content_w = rotate90 ? src_height : src_width;
+        const u32 content_h = rotate90 ? src_width : src_height;
+        if (content_w > width || content_h > height) {
+            return;
+        }
+        const u32 scale = std::min(width / content_w, height / content_h);
+        const u32 dest_w = content_w * scale;
+        const u32 dest_h = content_h * scale;
+        const u32 origin_x = (width - dest_w) / 2;
+        const u32 origin_y = (height - dest_h) / 2;
+
+        for (u32 y = 0; y < height; y++) {
+            auto* row = reinterpret_cast<u32*>(mapped + static_cast<u64>(y) * pitch);
+            const bool in_y = y >= origin_y && y < origin_y + dest_h;
+            const u32 dest_y = in_y ? (y - origin_y) / scale : 0;
+            for (u32 x = 0; x < width; x++) {
+                if (!in_y || x < origin_x || x >= origin_x + dest_w) {
+                    row[x] = 0;
+                    continue;
+                }
+                const u32 dest_x = (x - origin_x) / scale;
+                u32 src_x = dest_x;
+                u32 src_y = dest_y;
+                if (rotate90) {
+                    if (!flip180) {
+                        // 90 degrees clockwise into the panel.
+                        src_x = dest_y;
+                        src_y = src_height - 1 - dest_x;
+                    } else {
+                        // 270 degrees clockwise (90 plus a 180 flip).
+                        src_x = src_width - 1 - dest_y;
+                        src_y = dest_x;
+                    }
+                } else if (flip180) {
+                    src_x = src_width - 1 - dest_x;
+                    src_y = src_height - 1 - dest_y;
+                }
+                const u8* src =
+                    pixels + (static_cast<std::size_t>(src_y) * src_width + src_x) * 4;
+                row[x] = (0xffu << 24) | (static_cast<u32>(src[0]) << 16) |
+                         (static_cast<u32>(src[1]) << 8) | static_cast<u32>(src[2]);
+            }
+        }
     }
 
     static u32 FindProperty(int fd, u32 object_id, u32 object_type, const char* name) {
@@ -542,6 +602,11 @@ private:
             drmModeRmFB(fd, fb_id);
             fb_id = 0;
         }
+        if (mapped) {
+            munmap(mapped, mapped_size);
+            mapped = nullptr;
+            mapped_size = 0;
+        }
         if (dumb_handle != 0) {
             drm_mode_destroy_dumb dreq{};
             dreq.handle = dumb_handle;
@@ -563,6 +628,11 @@ private:
     u32 blob_id = 0;
     u32 dumb_handle = 0;
     u64 dumb_size = 0;
+    u8* mapped = nullptr;
+    u64 mapped_size = 0;
+    u32 pitch = 0;
+    u32 width = 0;
+    u32 height = 0;
     drmModeModeInfo mode{};
 };
 
@@ -571,6 +641,13 @@ DrmLeaseWindow::DrmLeaseWindow() : EmuWindow(true) {}
 void DrmLeaseWindow::PollEvents() {
     if (client) {
         client->PumpEvents();
+    }
+}
+
+void DrmLeaseWindow::PresentCpuFrame(const u8* pixels, u32 width, u32 height, bool content_rotate90,
+                                     bool content_flip180) {
+    if (dumb_proof) {
+        dumb_proof->Present(pixels, width, height, content_rotate90, content_flip180);
     }
 }
 
