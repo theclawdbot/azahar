@@ -1388,7 +1388,9 @@ bool GMainWindow::LoadROM(const QString& filename) {
                                touch_device ? touch_device : "auto", !explicit_connector)) {
             drm_lease_window = std::move(window);
             drm_lease_saved_layout = Settings::values.layout_option.GetValue();
-            Settings::values.layout_option.SetValue(Settings::LayoutOption::SeparateWindows);
+            Settings::values.layout_option.SetValue(
+                drm_lease_window->IsDumbProof() ? Settings::LayoutOption::Default
+                                                : Settings::LayoutOption::SeparateWindows);
             // The Qt windows computed their layouts before the override.
             render_window->OnFramebufferSizeChanged();
             secondary_window->OnFramebufferSizeChanged();

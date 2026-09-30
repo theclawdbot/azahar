@@ -11,6 +11,7 @@
 namespace Frontend {
 
 class DrmLeaseClient;
+class DrmLeaseDumbProof;
 class DrmLeaseTouch;
 
 /// Secondary EmuWindow backed by a DRM lease instead of a windowing system.
@@ -29,6 +30,10 @@ public:
     bool Initialize(const std::string& connector_name, int rotation,
                     const std::string& touch_device, bool internal_only);
 
+    bool IsDumbProof() const noexcept {
+        return dumb_proof != nullptr;
+    }
+
     void PollEvents() override;
 
     // The panel's mode and rotation are fixed; ignore settings-driven updates
@@ -38,6 +43,9 @@ public:
 
 private:
     std::unique_ptr<DrmLeaseClient> client;
+    // Holds the latched dumb framebuffer for AZAHAR_DRM_LEASE_DUMB_PROOF.
+    // Defined in the cpp so this header does not include xf86drmMode.h.
+    std::unique_ptr<DrmLeaseDumbProof> dumb_proof;
     std::unique_ptr<DrmLeaseTouch> touch;
     u32 mode_width = 0;
     u32 mode_height = 0;
