@@ -94,6 +94,7 @@ private:
     void ConfigureRenderPipeline();
     void PrepareRendertarget();
     void PresentDumbBottomScreen();
+    bool ReadbackBottomScreen(u32 width, u32 height);
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();
@@ -153,6 +154,22 @@ private:
     vk::ShaderModule cursor_fragment_shader{};
     vk::Pipeline cursor_pipeline{};
     vk::UniquePipelineLayout cursor_pipeline_layout{};
+
+    // Reused GPU readback of the prepared bottom-screen image. The target is
+    // RGBA8 so the bytes handed to PresentCpuFrame do not depend on the
+    // swapchain format. Destroyed by the device idle in the destructor.
+    vk::UniqueRenderPass bottom_readback_renderpass{};
+    vk::Pipeline bottom_readback_pipeline{};
+    vk::Image bottom_readback_image{};
+    vk::ImageView bottom_readback_view{};
+    vk::Framebuffer bottom_readback_framebuffer{};
+    VmaAllocation bottom_readback_allocation{};
+    vk::Buffer bottom_readback_buffer{};
+    VmaAllocation bottom_readback_buffer_allocation{};
+    void* bottom_readback_mapped{};
+    vk::DeviceSize bottom_readback_mapped_size{};
+    u32 bottom_readback_width{};
+    u32 bottom_readback_height{};
     bool isSecondaryWindow;
     bool secondaryWindowEnabled;
     bool screenRendered;

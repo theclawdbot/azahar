@@ -24,6 +24,7 @@
 #include "video_core/host_shaders/vulkan_cursor_frag.h"
 #include "video_core/host_shaders/vulkan_cursor_vert.h"
 
+#include <algorithm>
 #include <limits>
 #include <vk_mem_alloc.h>
 #if defined(__APPLE__) && !defined(HAVE_LIBRETRO)
@@ -169,6 +170,23 @@ RendererVulkan::~RendererVulkan() {
     device.destroyPipeline(cursor_pipeline);
     device.destroyShaderModule(cursor_vertex_shader);
     device.destroyShaderModule(cursor_fragment_shader);
+
+    if (bottom_readback_pipeline) {
+        device.destroyPipeline(bottom_readback_pipeline);
+    }
+    if (bottom_readback_framebuffer) {
+        device.destroyFramebuffer(bottom_readback_framebuffer);
+    }
+    if (bottom_readback_view) {
+        device.destroyImageView(bottom_readback_view);
+    }
+    if (bottom_readback_image) {
+        vmaDestroyImage(instance.GetAllocator(), bottom_readback_image, bottom_readback_allocation);
+    }
+    if (bottom_readback_buffer) {
+        vmaDestroyBuffer(instance.GetAllocator(), bottom_readback_buffer,
+                         bottom_readback_buffer_allocation);
+    }
 }
 
 void RendererVulkan::PrepareRendertarget() {
@@ -201,144 +219,281 @@ void RendererVulkan::PresentDumbBottomScreen() {
         return;
     }
 
+    // PrepareRendertarget has already placed the visible bottom image in
+    // screen_infos[2]. Guest memory stays zero for accelerated display
+    // transfers, so read that image back instead of decoding the framebuffer.
     const auto& framebuffer = pica.regs.framebuffer_config[1];
-    const auto& color_fill = pica.regs_lcd.color_fill_bottom;
-
     const u32 fb_width = framebuffer.width;
     const u32 fb_height = framebuffer.height;
     if (fb_width == 0 || fb_height == 0 || fb_width > 1024 || fb_height > 1024) {
         return;
     }
-
-    const u32 bpp = [&] {
-        switch (framebuffer.color_format) {
-        case Pica::PixelFormat::RGBA8:
-            return 4u;
-        case Pica::PixelFormat::RGB8:
-            return 3u;
-        case Pica::PixelFormat::RGB565:
-        case Pica::PixelFormat::RGB5A1:
-        case Pica::PixelFormat::RGBA4:
-            return 2u;
-        default:
-            return 0u;
-        }
-    }();
-    if (bpp == 0 || framebuffer.stride < fb_width * bpp || (framebuffer.stride % bpp) != 0) {
-        return;
-    }
-    const u32 pixel_stride = framebuffer.stride / bpp;
-    const u64 framebuffer_size = static_cast<u64>(framebuffer.stride) * fb_height;
-    if (framebuffer_size == 0 || framebuffer_size > std::numeric_limits<u32>::max()) {
+    if (!screen_infos[2].image_view) {
         return;
     }
 
-    const PAddr framebuffer_addr =
-        framebuffer.active_fb == 0 ? framebuffer.address_left1 : framebuffer.address_left2;
-    const u64 framebuffer_end = static_cast<u64>(framebuffer_addr) + framebuffer_size;
-    const auto contained_in = [framebuffer_addr, framebuffer_end](PAddr start, PAddr end) {
-        return framebuffer_addr >= start && framebuffer_end <= static_cast<u64>(end);
-    };
-    const bool contiguous =
-        contained_in(Memory::VRAM_PADDR, Memory::VRAM_PADDR_END) ||
-        contained_in(Memory::N3DS_EXTRA_RAM_PADDR, Memory::N3DS_EXTRA_RAM_PADDR_END) ||
-        contained_in(Memory::DSP_RAM_PADDR, Memory::DSP_RAM_PADDR_END) ||
-        contained_in(Memory::FCRAM_PADDR, Memory::FCRAM_N3DS_PADDR_END);
-    if (!contiguous) {
+    // Native bottom LCD is 320x240 landscape. Cap the readback at 4x so a
+    // resolution-scale setting cannot grow the synchronous copy without bound.
+    const u32 scale = std::clamp(GetResolutionScaleFactor(), 1u, 4u);
+    const u32 output_width = 320u * scale;
+    const u32 output_height = 240u * scale;
+    if (!ReadbackBottomScreen(output_width, output_height)) {
         return;
     }
-
-    const u8* framebuffer_data = nullptr;
-    if (!color_fill.is_enabled) {
-        // Accelerated display transfers may leave the guest framebuffer dirty in
-        // the Vulkan rasterizer cache. Flush it to emulated memory before the CPU
-        // decoder reads it, then wait for the transfer to complete.
-        rasterizer.FlushRegion(framebuffer_addr, static_cast<u32>(framebuffer_size));
-        scheduler.Finish();
-        framebuffer_data = memory.GetPhysicalPointer(framebuffer_addr);
-        if (!framebuffer_data) {
-            return;
-        }
-    }
-
-    static u64 kms_debug_frame = 0;
-    const bool log_kms_frame = kms_debug_frame < 5 || (kms_debug_frame % 300) == 0;
-    u64 raw_checksum = 0;
-    u32 raw_nonzero = 0;
-    if (log_kms_frame && framebuffer_data) {
-        for (u64 offset = 0; offset < framebuffer_size; offset += 97) {
-            raw_checksum = (raw_checksum * 131) + framebuffer_data[offset];
-            raw_nonzero += framebuffer_data[offset] != 0;
-        }
-    }
-
-    // The 3DS LCD buffer is portrait-oriented (240x320), while the emulated
-    // bottom screen is landscape (320x240). Match RendererSoftware's proven
-    // transpose: display (dx,dy) reads guest (x=dy,y=dx).
-    const u32 output_width = fb_height;
-    const u32 output_height = fb_width;
-    cpu_bottom_frame.resize(static_cast<std::size_t>(output_width) * output_height * 4);
-    u32 decoded_nonblack = 0;
-    for (u32 dy = 0; dy < output_height; dy++) {
-        for (u32 dx = 0; dx < output_width; dx++) {
-            Common::Vec4<u8> color;
-            if (color_fill.is_enabled) {
-                color = Common::Vec4<u8>(static_cast<u8>(color_fill.color_r),
-                                         static_cast<u8>(color_fill.color_g),
-                                         static_cast<u8>(color_fill.color_b), 255);
-            } else {
-                const u8* pixel =
-                    framebuffer_data +
-                    (static_cast<std::size_t>(dx) * pixel_stride + (pixel_stride - dy - 1)) * bpp;
-                switch (framebuffer.color_format) {
-                case Pica::PixelFormat::RGBA8:
-                    color = Common::Color::DecodeRGBA8(pixel);
-                    break;
-                case Pica::PixelFormat::RGB8:
-                    color = Common::Color::DecodeRGB8(pixel);
-                    break;
-                case Pica::PixelFormat::RGB565:
-                    color = Common::Color::DecodeRGB565(pixel);
-                    break;
-                case Pica::PixelFormat::RGB5A1:
-                    color = Common::Color::DecodeRGB5A1(pixel);
-                    break;
-                case Pica::PixelFormat::RGBA4:
-                    color = Common::Color::DecodeRGBA4(pixel);
-                    break;
-                default:
-                    color = {};
-                    break;
-                }
-            }
-            u8* dest = cpu_bottom_frame.data() +
-                       (static_cast<std::size_t>(dy) * output_width + dx) * 4;
-            dest[0] = color.r();
-            dest[1] = color.g();
-            dest[2] = color.b();
-            dest[3] = color.a();
-            decoded_nonblack += color.r() != 0 || color.g() != 0 || color.b() != 0;
-        }
-    }
-
-    if (log_kms_frame) {
-        const u32 format_value =
-            static_cast<u32>(static_cast<Pica::PixelFormat>(framebuffer.color_format));
-        const bool fill_enabled = static_cast<bool>(color_fill.is_enabled);
-        LOG_INFO(Render_Vulkan,
-                 "KMS bottom frame {} addr={:#010x} {}x{} stride={} format={} fill={} raw_nonzero={} raw_checksum={:#016x} decoded_nonblack={}",
-                 kms_debug_frame, framebuffer_addr, fb_width, fb_height,
-                 static_cast<u32>(framebuffer.stride), format_value, fill_enabled, raw_nonzero,
-                 raw_checksum, decoded_nonblack);
-    }
-    kms_debug_frame++;
 
     const auto& layout = secondary_window->GetFramebufferLayout();
-    // The CPU decoder already transposed the portrait guest framebuffer into
-    // a normal 320x240 landscape image. Apply only the panel's physical
-    // orientation here (90 for Side Up, plus 180 for the 270-degree case).
-    secondary_window->PresentCpuFrame(cpu_bottom_frame.data(), output_width, output_height, true,
+    // Pixels are already the landscape image the top window samples. Present
+    // applies only the panel orientation (90 for Side Up, plus 180 for 270).
+    secondary_window->PresentCpuFrame(cpu_bottom_frame.data(), output_width, output_height, false,
                                       layout.is_flipped);
+}
+
+bool RendererVulkan::ReadbackBottomScreen(u32 width, u32 height) {
+    const vk::Device device = instance.GetDevice();
+    const vk::Extent2D extent{width, height};
+
+    // End any rasterizer render pass before sampling its image and drawing
+    // into the readback target on the same queue.
+    renderpass_cache.EndRendering();
+
+    if (bottom_readback_width != width || bottom_readback_height != height) {
+        // Resource dimensions are stable in normal use, but finish any queued
+        // work before replacing allocations on an unexpected size change.
+        scheduler.Finish();
+        if (bottom_readback_framebuffer) {
+            device.destroyFramebuffer(bottom_readback_framebuffer);
+            bottom_readback_framebuffer = nullptr;
+        }
+        if (bottom_readback_view) {
+            device.destroyImageView(bottom_readback_view);
+            bottom_readback_view = nullptr;
+        }
+        if (bottom_readback_image) {
+            vmaDestroyImage(instance.GetAllocator(), bottom_readback_image,
+                            bottom_readback_allocation);
+            bottom_readback_image = nullptr;
+            bottom_readback_allocation = nullptr;
+        }
+        if (bottom_readback_buffer) {
+            vmaDestroyBuffer(instance.GetAllocator(), bottom_readback_buffer,
+                             bottom_readback_buffer_allocation);
+            bottom_readback_buffer = nullptr;
+            bottom_readback_buffer_allocation = nullptr;
+            bottom_readback_mapped = nullptr;
+            bottom_readback_mapped_size = 0;
+        }
+
+        const vk::ImageCreateInfo image_info = {
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc,
+        };
+        const VmaAllocationCreateInfo image_alloc_info = {
+            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        };
+        VkImage unsafe_image{};
+        VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
+        const VkResult image_result =
+            vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &image_alloc_info,
+                           &unsafe_image, &bottom_readback_allocation, nullptr);
+        if (image_result != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Bottom-screen readback image allocation failed: {}",
+                      image_result);
+            return false;
+        }
+        bottom_readback_image = vk::Image{unsafe_image};
+
+        const vk::ImageViewCreateInfo view_info = {
+            .image = bottom_readback_image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        bottom_readback_view = device.createImageView(view_info);
+
+        const vk::FramebufferCreateInfo framebuffer_info = {
+            .renderPass = *bottom_readback_renderpass,
+            .attachmentCount = 1,
+            .pAttachments = &bottom_readback_view,
+            .width = width,
+            .height = height,
+            .layers = 1,
+        };
+        bottom_readback_framebuffer = device.createFramebuffer(framebuffer_info);
+
+        const vk::DeviceSize buffer_size = static_cast<vk::DeviceSize>(width) * height * 4;
+        const vk::BufferCreateInfo buffer_info = {
+            .size = buffer_size,
+            .usage = vk::BufferUsageFlagBits::eTransferDst,
+        };
+        const VmaAllocationCreateInfo buffer_alloc_info = {
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        };
+        VkBuffer unsafe_buffer{};
+        VmaAllocationInfo buffer_allocation_info{};
+        VkBufferCreateInfo unsafe_buffer_info = static_cast<VkBufferCreateInfo>(buffer_info);
+        const VkResult buffer_result =
+            vmaCreateBuffer(instance.GetAllocator(), &unsafe_buffer_info, &buffer_alloc_info,
+                            &unsafe_buffer, &bottom_readback_buffer_allocation,
+                            &buffer_allocation_info);
+        if (buffer_result != VK_SUCCESS || !buffer_allocation_info.pMappedData) {
+            LOG_ERROR(Render_Vulkan, "Bottom-screen readback buffer allocation failed: {}",
+                      buffer_result);
+            device.destroyFramebuffer(bottom_readback_framebuffer);
+            device.destroyImageView(bottom_readback_view);
+            vmaDestroyImage(instance.GetAllocator(), bottom_readback_image,
+                            bottom_readback_allocation);
+            bottom_readback_framebuffer = nullptr;
+            bottom_readback_view = nullptr;
+            bottom_readback_image = nullptr;
+            bottom_readback_allocation = nullptr;
+            if (buffer_result == VK_SUCCESS) {
+                vmaDestroyBuffer(instance.GetAllocator(), unsafe_buffer,
+                                 bottom_readback_buffer_allocation);
+            }
+            bottom_readback_buffer_allocation = nullptr;
+            return false;
+        }
+        bottom_readback_buffer = vk::Buffer{unsafe_buffer};
+        bottom_readback_mapped = buffer_allocation_info.pMappedData;
+        bottom_readback_mapped_size = buffer_allocation_info.size;
+        bottom_readback_width = width;
+        bottom_readback_height = height;
+    }
+
+    for (u32 index = 0; index < screen_infos.size(); index++) {
+        if (!screen_infos[index].image_view) {
+            LOG_ERROR(Render_Vulkan, "Bottom-screen readback missing screen image {}", index);
+            return false;
+        }
+    }
+    const auto sampler = present_samplers[!Settings::values.filter_mode.GetValue()];
+    const auto present_set = present_heap.Commit();
+    for (u32 index = 0; index < screen_infos.size(); index++) {
+        update_queue.AddImageSampler(present_set, 0, index, screen_infos[index].image_view, sampler);
+    }
+
+    Layout::FramebufferLayout layout{};
+    layout.width = width;
+    layout.height = height;
+    layout.top_screen_enabled = false;
+    layout.bottom_screen_enabled = true;
+    layout.bottom_screen = {0, height, width, 0};
+    layout.is_rotated = true;
+    layout.render_3d_mode = Settings::StereoRenderOption::Off;
+
+    const vk::ClearValue clear{.color = vk::ClearColorValue{std::array{0.f, 0.f, 0.f, 1.f}}};
+    const vk::RenderPass renderpass = *bottom_readback_renderpass;
+    const vk::Framebuffer framebuffer = bottom_readback_framebuffer;
+    scheduler.Record([renderpass, framebuffer, extent, clear](vk::CommandBuffer cmdbuf) {
+        const vk::RenderPassBeginInfo begin_info = {
+            .renderPass = renderpass,
+            .framebuffer = framebuffer,
+            .renderArea = {.offset = {0, 0}, .extent = extent},
+            .clearValueCount = 1,
+            .pClearValues = &clear,
+        };
+        cmdbuf.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+        const vk::Viewport viewport = {
+            .x = 0.0f,
+            .y = 0.0f,
+            .width = static_cast<float>(extent.width),
+            .height = static_cast<float>(extent.height),
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        const vk::Rect2D scissor = {.offset = {0, 0}, .extent = extent};
+        cmdbuf.setViewport(0, viewport);
+        cmdbuf.setScissor(0, scissor);
+    });
+
+    const vk::Pipeline pipeline = bottom_readback_pipeline;
+    const vk::PipelineLayout pipeline_layout = *present_pipeline_layout;
+    scheduler.Record([pipeline, pipeline_layout, present_set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, present_set,
+                                  {});
+    });
+
+    draw_info.modelview = MakeOrthographicMatrix(width, height);
+    draw_info.layer = 0;
+    ApplySecondLayerOpacity(1.0f);
+    DrawBottomScreen(layout, layout.bottom_screen);
+    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
+
+    const vk::Buffer staging_buffer = bottom_readback_buffer;
+    const vk::Image source_image = bottom_readback_image;
+    scheduler.Record([width, height, source_image, staging_buffer](vk::CommandBuffer cmdbuf) {
+        const vk::ImageMemoryBarrier read_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = source_image,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        const vk::BufferImageCopy image_copy = {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource =
+                {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        };
+        static constexpr vk::MemoryBarrier host_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+                               {}, {}, read_barrier);
+        cmdbuf.copyImageToBuffer(source_image, vk::ImageLayout::eTransferSrcOptimal, staging_buffer,
+                                 image_copy);
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eAllCommands, {}, host_barrier, {}, {});
+    });
+
+    // Synchronous prototype: the scheduler blocks until this frame's copy is
+    // visible to the host before the dumb buffer is written.
+    scheduler.Finish();
+
+    const std::size_t byte_count = static_cast<std::size_t>(width) * height * 4;
+    if (bottom_readback_mapped_size < byte_count) {
+        LOG_ERROR(Render_Vulkan, "Bottom-screen readback mapping is {} bytes, need {}",
+                  bottom_readback_mapped_size, byte_count);
+        return false;
+    }
+    cpu_bottom_frame.resize(byte_count);
+    std::memcpy(cpu_bottom_frame.data(), bottom_readback_mapped, byte_count);
+    return true;
 }
 
 void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
@@ -639,6 +794,68 @@ void RendererVulkan::BuildPipelines() {
             instance.GetDevice().createGraphicsPipeline({}, pipeline_info);
         ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build present pipelines");
         present_pipelines[i] = pipeline;
+    }
+
+    // RGBA8 twin of the mono present pipeline. The swapchain pass may be BGRA,
+    // which is not render-pass compatible with the readback target.
+    {
+        const vk::AttachmentReference color_ref = {
+            .attachment = 0,
+            .layout = vk::ImageLayout::eColorAttachmentOptimal,
+        };
+        const vk::SubpassDescription subpass = {
+            .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color_ref,
+        };
+        const vk::AttachmentDescription color_attachment = {
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .samples = vk::SampleCountFlagBits::e1,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+            .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+            .initialLayout = vk::ImageLayout::eUndefined,
+            .finalLayout = vk::ImageLayout::eTransferSrcOptimal,
+        };
+        const vk::RenderPassCreateInfo renderpass_info = {
+            .attachmentCount = 1,
+            .pAttachments = &color_attachment,
+            .subpassCount = 1,
+            .pSubpasses = &subpass,
+        };
+        bottom_readback_renderpass = instance.GetDevice().createRenderPassUnique(renderpass_info);
+
+        const std::array readback_stages = {
+            vk::PipelineShaderStageCreateInfo{
+                .stage = vk::ShaderStageFlagBits::eVertex,
+                .module = present_vertex_shader,
+                .pName = "main",
+            },
+            vk::PipelineShaderStageCreateInfo{
+                .stage = vk::ShaderStageFlagBits::eFragment,
+                .module = present_shaders[0],
+                .pName = "main",
+            },
+        };
+        const vk::GraphicsPipelineCreateInfo readback_info = {
+            .stageCount = static_cast<u32>(readback_stages.size()),
+            .pStages = readback_stages.data(),
+            .pVertexInputState = &vertex_input_info,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState = &viewport_info,
+            .pRasterizationState = &raster_state,
+            .pMultisampleState = &multisampling,
+            .pDepthStencilState = &depth_info,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_info,
+            .layout = *present_pipeline_layout,
+            .renderPass = *bottom_readback_renderpass,
+        };
+        const auto [readback_result, readback_pipeline] =
+            instance.GetDevice().createGraphicsPipeline({}, readback_info);
+        ASSERT_MSG(readback_result == vk::Result::eSuccess, "Unable to build bottom readback pipeline");
+        bottom_readback_pipeline = readback_pipeline;
     }
 
     // Build cursor pipeline (simple position-only, inverted color blending)
