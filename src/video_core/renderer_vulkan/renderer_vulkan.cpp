@@ -261,12 +261,24 @@ void RendererVulkan::PresentDumbBottomScreen() {
         }
     }
 
+    static u64 kms_debug_frame = 0;
+    const bool log_kms_frame = kms_debug_frame < 5 || (kms_debug_frame % 300) == 0;
+    u64 raw_checksum = 0;
+    u32 raw_nonzero = 0;
+    if (log_kms_frame && framebuffer_data) {
+        for (u64 offset = 0; offset < framebuffer_size; offset += 97) {
+            raw_checksum = (raw_checksum * 131) + framebuffer_data[offset];
+            raw_nonzero += framebuffer_data[offset] != 0;
+        }
+    }
+
     // The 3DS LCD buffer is portrait-oriented (240x320), while the emulated
     // bottom screen is landscape (320x240). Match RendererSoftware's proven
     // transpose: display (dx,dy) reads guest (x=dy,y=dx).
     const u32 output_width = fb_height;
     const u32 output_height = fb_width;
     cpu_bottom_frame.resize(static_cast<std::size_t>(output_width) * output_height * 4);
+    u32 decoded_nonblack = 0;
     for (u32 dy = 0; dy < output_height; dy++) {
         for (u32 dx = 0; dx < output_width; dx++) {
             Common::Vec4<u8> color;
@@ -305,8 +317,18 @@ void RendererVulkan::PresentDumbBottomScreen() {
             dest[1] = color.g();
             dest[2] = color.b();
             dest[3] = color.a();
+            decoded_nonblack += color.r() != 0 || color.g() != 0 || color.b() != 0;
         }
     }
+
+    if (log_kms_frame) {
+        LOG_INFO(Render_Vulkan,
+                 "KMS bottom frame {} addr={:#010x} {}x{} stride={} format={} fill={} raw_nonzero={} raw_checksum={:#016x} decoded_nonblack={}",
+                 kms_debug_frame, framebuffer_addr, fb_width, fb_height, framebuffer.stride,
+                 static_cast<u32>(framebuffer.color_format), color_fill.is_enabled, raw_nonzero,
+                 raw_checksum, decoded_nonblack);
+    }
+    kms_debug_frame++;
 
     const auto& layout = secondary_window->GetFramebufferLayout();
     // The CPU decoder already transposed the portrait guest framebuffer into
