@@ -30,10 +30,6 @@ public:
     bool Initialize(const std::string& connector_name, int rotation,
                     const std::string& touch_device, bool internal_only);
 
-    bool IsDumbProof() const noexcept {
-        return dumb_proof != nullptr;
-    }
-
     void PollEvents() override;
 
     // The panel's mode and rotation are fixed; ignore settings-driven updates

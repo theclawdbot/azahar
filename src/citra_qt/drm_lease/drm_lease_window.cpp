@@ -696,6 +696,9 @@ bool DrmLeaseWindow::Initialize(const std::string& connector_name, int rotation,
         // Drm window: RendererVulkan must not build a VK_KHR_display surface.
         window_info.type = WindowSystemType::Headless;
         UpdateCurrentFramebufferLayout(mode_width, mode_height);
+        if (!touch_device.empty()) {
+            touch = std::make_unique<DrmLeaseTouch>(*this, touch_device);
+        }
         LOG_INFO(Frontend, "drm-lease: dumb proof latched, Vulkan display surface skipped");
         return true;
     }
